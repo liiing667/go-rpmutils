@@ -118,8 +118,10 @@ func digestForSigning(sigHeader, genHeader *rpmHeader, payloadReader io.Reader, 
 	// write header
 	genHash.Write(genHeader.orig)
 	combinedHash.Write(genHeader.orig)
-	// write and verify payload
-	err = digestPayload(sigHeader, genHeader, payloadReader, []io.Writer{combinedHash})
+	// write and verify payload; legacy packages may only carry weak
+	// digests, which are still better than signing unverified contents
+	verifyOpts := &VerifyOptions{AllowWeakDigests: true}
+	err = digestPayload(sigHeader, genHeader, payloadReader, []io.Writer{combinedHash}, verifyOpts)
 	return genHash, combinedHash, err
 }
 

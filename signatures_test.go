@@ -54,7 +54,8 @@ func TestSign(t *testing.T) {
 		t.Fatal("error seeking:", err)
 	}
 	signed := io.MultiReader(bytes.NewReader(sigblob), f)
-	_, sigs, err := Verify(signed, keyring)
+	// the test package only carries legacy SHA1/MD5 digests
+	_, sigs, err := VerifyWithOptions(signed, keyring, &VerifyOptions{AllowWeakDigests: true})
 	if err != nil {
 		t.Fatal("error verifying signature:", err)
 	}

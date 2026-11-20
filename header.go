@@ -105,7 +105,12 @@ func readHeader(f io.Reader, hash string, hashType crypto.Hash, isSource bool, s
 		h.Write(origBuf.Bytes())
 		calculated := hex.EncodeToString(h.Sum(nil))
 		if calculated != hash {
-			return nil, fmt.Errorf("%s mismatch in signature header", hashType)
+			return nil, &DigestMismatchError{
+				Scope:    "header",
+				Hash:     hashType,
+				Expected: hash,
+				Actual:   calculated,
+			}
 		}
 	}
 	// parse entries
