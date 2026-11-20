@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -98,8 +99,29 @@ type KeyNotFoundError struct {
 }
 
 func (e KeyNotFoundError) Error() string {
-	if e.KeyID == 0 && len(e.Fingerprint) > 0 {
+	if e.KeyID != 0 && len(e.Fingerprint) > 0 {
+		return fmt.Sprintf("key with keyid %08x or fingerprint %x not found", e.KeyID, e.Fingerprint)
+	}
+	if len(e.Fingerprint) > 0 {
 		return fmt.Sprintf("key with fingerprint %x not found", e.Fingerprint)
 	}
 	return fmt.Sprintf("keyid %08x not found", e.KeyID)
+}
+
+// KeyCollisionError is returned when the key ID of a signature matches more
+// than one distinct key in the keyring, so the signing key cannot be
+// determined unambiguously.
+type KeyCollisionError struct {
+	KeyID uint64
+	// Fingerprints contains the fingerprints of the distinct keys that share
+	// the colliding key ID.
+	Fingerprints [][]byte
+}
+
+func (e KeyCollisionError) Error() string {
+	fps := make([]string, len(e.Fingerprints))
+	for i, fp := range e.Fingerprints {
+		fps[i] = fmt.Sprintf("%x", fp)
+	}
+	return fmt.Sprintf("keyid %08x matches multiple keys: %s", e.KeyID, strings.Join(fps, ", "))
 }

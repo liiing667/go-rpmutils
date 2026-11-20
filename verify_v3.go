@@ -24,12 +24,17 @@ func parseSignatureMaybeV3(genpkt packet.Packet, knownKeys openpgp.EntityList) (
 		if knownKeys == nil {
 			return nil
 		}
-		keys := knownKeys.KeysById(pkt.IssuerKeyId)
-		if len(keys) == 0 || keys[0].PublicKey == nil {
+		// V3 signatures only carry a key ID, so look the key up by ID and
+		// reject ambiguous matches instead of picking the first one.
+		entity, key, err := findKeyByKeyId(knownKeys, pkt.IssuerKeyId)
+		if err != nil {
+			return err
+		}
+		if key == nil {
 			return KeyNotFoundError{KeyID: pkt.IssuerKeyId}
 		}
-		setEntity(sig, keys[0].Entity)
-		return keys[0].PublicKey.VerifySignatureV3(h, pkt)
+		setEntity(sig, entity, key)
+		return key.VerifySignatureV3(h, pkt)
 	}
 	return sig, nil
 }
