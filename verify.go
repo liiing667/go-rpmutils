@@ -17,6 +17,7 @@
 package rpmutils
 
 import (
+	"bytes"
 	"crypto"
 	"errors"
 	"fmt"
@@ -75,6 +76,53 @@ func Verify(stream io.Reader, knownKeys openpgp.EntityList) (header *RpmHeader, 
 	for i, sig := range sigs {
 		h := hashes[i]
 		if err := sig.validate(h); err != nil {
+			return nil, nil, err
+		}
+	}
+	hdr := &RpmHeader{
+		lead:      lead,
+		sigHeader: sigHeader,
+		genHeader: genHeader,
+		isSource:  sigHeader.isSource,
+	}
+	return hdr, sigs, nil
+}
+
+// VerifyDetachedSignature verifies a detached signature header, as exported by
+// (*RpmHeader).DumpSignatureHeader, against the RPM it was detached from.
+//
+// rpmStream is read from the start of the RPM file; its own lead and signature
+// header are skipped. The general header is checked against the digest recorded
+// in the detached signature header, the payload is checked against the digest
+// recorded in the general header, and the PGP signatures carried by the
+// detached header are verified against knownKeys. Tampering with either the
+// detached header or the package contents therefore causes verification to
+// fail. The returned header and Signature values expose the state that was
+// read back from the detached header.
+func VerifyDetachedSignature(detached []byte, rpmStream io.Reader, knownKeys openpgp.EntityList) (header *RpmHeader, sigs []*Signature, err error) {
+	lead, sigHeader, err := readSignatureHeader(bytes.NewReader(detached))
+	if err != nil {
+		return nil, nil, fmt.Errorf("error reading detached signature header: %s", err.Error())
+	}
+	// skip the lead and signature header of the package itself
+	if _, _, err = readSignatureHeader(rpmStream); err != nil {
+		return nil, nil, err
+	}
+	// parse the general header, checking it against the digest recorded in
+	// the detached signature header
+	headerDigestValue, headerDigestType := getHashAndType(sigHeader)
+	genHeader, err := readHeader(rpmStream, headerDigestValue, headerDigestType, sigHeader.isSource, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	// digest the payload and collect the PGP signatures from the detached header
+	sigs, hashes, err := digestAndVerify(sigHeader, genHeader, rpmStream, knownKeys)
+	if err != nil {
+		return nil, nil, err
+	}
+	// verify PGP signatures
+	for i, sig := range sigs {
+		if err := sig.validate(hashes[i]); err != nil {
 			return nil, nil, err
 		}
 	}
