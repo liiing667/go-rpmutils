@@ -24,12 +24,39 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"path"
 	"strconv"
 	"strings"
 )
 
 const introMagic = 0x8eade801
+
+// Hard upper bounds on a single header section. They are large enough for any
+// well-formed RPM while preventing a malformed header from triggering huge
+// allocations or out-of-memory failures.
+const (
+	maxHeaderEntries = 1 << 20 // at most 1M index entries (~16MiB index)
+	maxHeaderSize    = 1 << 28 // at most 256MiB of entry data
+)
+
+// stringTypes are null-terminated string data types. A single string entry is
+// always followed by a trailing NUL byte, while string arrays hold one NUL
+// terminated string per element.
+var stringTypes = map[int32]bool{
+	RPM_STRING_TYPE:       true,
+	RPM_STRING_ARRAY_TYPE: true,
+	RPM_I18NSTRING_TYPE:   true,
+}
+
+// regionTags delimit RPM header regions. They must hold a 16-byte BIN value
+// containing the region trailer.
+var regionTags = map[int32]bool{
+	RPMTAG_HEADERSIGNATURES: true,
+	RPMTAG_HEADERIMMUTABLE:  true,
+	RPMTAG_HEADERREGIONS:    true,
+}
 
 type entry struct {
 	dataType, count int32
@@ -84,8 +111,23 @@ func readHeader(f io.Reader, hash string, hashType crypto.Hash, isSource bool, s
 	if intro.Magic != introMagic {
 		return nil, fmt.Errorf("bad magic for header")
 	}
+	if intro.Entries == 0 {
+		return nil, fmt.Errorf("RPM header has no entries")
+	}
+	if intro.Entries > maxHeaderEntries {
+		return nil, fmt.Errorf("RPM header entry count %d exceeds maximum of %d", intro.Entries, maxHeaderEntries)
+	}
+	if intro.Size > maxHeaderSize {
+		return nil, fmt.Errorf("RPM header data size %d exceeds maximum of %d", intro.Size, maxHeaderSize)
+	}
+	// Entries*16 cannot overflow on 32-bit platforms thanks to the bound above,
+	// but guard anyway so a future limit change cannot reintroduce the issue.
+	hi, tableLen := bits.Mul64(uint64(intro.Entries), 16)
+	if hi != 0 || tableLen > math.MaxInt {
+		return nil, fmt.Errorf("RPM header table size overflows for %d entries", intro.Entries)
+	}
 	// read entries
-	entryTable, err := readExact(f, int(intro.Entries*16))
+	entryTable, err := readExact(f, int(tableLen))
 	if err != nil {
 		return nil, fmt.Errorf("error reading RPM header table: %s", err.Error())
 	}
@@ -94,6 +136,9 @@ func readHeader(f io.Reader, hash string, hashType crypto.Hash, isSource bool, s
 	if sigBlock {
 		// signature block is padded to 8 byte alignment
 		size = (size + 7) / 8 * 8
+		if size > maxHeaderSize+7 {
+			return nil, fmt.Errorf("RPM header data size %d exceeds maximum", size)
+		}
 	}
 	data, err := readExact(f, int(size))
 	if err != nil {
@@ -116,20 +161,53 @@ func readHeader(f io.Reader, hash string, hashType crypto.Hash, isSource bool, s
 		if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
 			return nil, err
 		}
+		if tag.Offset < 0 {
+			return nil, fmt.Errorf("tag %d has negative offset %d", tag.Tag, tag.Offset)
+		}
+		if tag.Count < 0 {
+			return nil, fmt.Errorf("tag %d has negative count %d", tag.Tag, tag.Count)
+		}
+		if uint32(tag.Offset) > intro.Size {
+			return nil, fmt.Errorf("tag %d offset %d is outside of header data", tag.Tag, tag.Offset)
+		}
+		var end uint64
 		typeSize, ok := typeSizes[tag.DataType]
-		var end int
 		if ok {
-			end = int(tag.Offset) + typeSize*int(tag.Count)
-		} else {
+			hi, dataLen := bits.Mul64(uint64(tag.Count), uint64(typeSize))
+			if hi != 0 {
+				return nil, fmt.Errorf("tag %d data length overflows", tag.Tag)
+			}
+			end64, carry := bits.Add64(uint64(tag.Offset), dataLen, 0)
+			if carry != 0 || end64 > uint64(intro.Size) {
+				return nil, fmt.Errorf("tag %d data extends beyond header data", tag.Tag)
+			}
+			end = end64
+			if regionTags[tag.Tag] {
+				if tag.DataType != RPM_BIN_TYPE || tag.Count != 16 {
+					return nil, fmt.Errorf("region tag %d must be a 16-byte BIN entry", tag.Tag)
+				}
+			}
+		} else if stringTypes[tag.DataType] {
 			// String types are null-terminated
-			end = int(tag.Offset)
+			if tag.Count == 0 {
+				return nil, fmt.Errorf("string tag %d has no elements", tag.Tag)
+			}
+			end = uint64(tag.Offset)
 			for i := 0; i < int(tag.Count); i++ {
+				if end >= uint64(len(data)) {
+					return nil, fmt.Errorf("tag %d is truncated", tag.Tag)
+				}
 				next := bytes.IndexByte(data[end:], 0)
 				if next < 0 {
 					return nil, fmt.Errorf("tag %d is truncated", tag.Tag)
 				}
-				end += next + 1
+				end += uint64(next) + 1
+				if end > uint64(intro.Size) {
+					return nil, fmt.Errorf("tag %d string data extends beyond header data", tag.Tag)
+				}
 			}
+		} else {
+			return nil, DataTypeError{Tag: int(tag.Tag), DataType: int(tag.DataType)}
 		}
 		ents[int(tag.Tag)] = entry{
 			dataType: tag.DataType,
@@ -172,7 +250,7 @@ func (hdr *rpmHeader) Get(tag int) (interface{}, error) {
 	case RPM_BIN_TYPE:
 		return hdr.GetBytes(tag)
 	default:
-		return nil, fmt.Errorf("unsupported data type")
+		return nil, DataTypeError{Tag: tag, DataType: int(ent.dataType)}
 	}
 }
 
@@ -208,6 +286,9 @@ func (hdr *rpmHeader) GetStrings(tag int) ([]string, error) {
 		return nil, fmt.Errorf("unsupported datatype for string: %d, tag: %d", ent.dataType, tag)
 	}
 	strs := strings.Split(string(ent.contents), "\x00")
+	if len(strs) < int(ent.count) {
+		return nil, fmt.Errorf("string tag %d is truncated", tag)
+	}
 	return strs[:ent.count], nil
 }
 

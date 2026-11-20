@@ -31,3 +31,13 @@ func (err NoSuchTagError) Error() string {
 func NewNoSuchTagError(tag int) NoSuchTagError {
 	return NoSuchTagError{Tag: tag}
 }
+
+// DataTypeError is returned when a header entry uses an unknown data type
+type DataTypeError struct {
+	Tag      int
+	DataType int
+}
+
+func (err DataTypeError) Error() string {
+	return fmt.Sprintf("unsupported data type %d for tag %d", err.DataType, err.Tag)
+}
