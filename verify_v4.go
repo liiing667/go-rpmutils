@@ -32,18 +32,26 @@ func parseSignatureV4(genpkt packet.Packet, knownKeys openpgp.EntityList) (*Sign
 	if pkt.IssuerKeyId != nil {
 		sig.KeyId = *pkt.IssuerKeyId
 	}
+	// Freeze the keyring generation and the issuer identity at the time the
+	// verification candidate is created. Resolving the key lazily during
+	// validation would allow a keyring rotation to mix an issuer resolved
+	// from one keyring generation with digest results from another, leaving
+	// the caller unable to tell which key actually signed the package.
+	entity, key := findKey(pkt, knownKeys)
+	if entity != nil {
+		setEntity(sig, entity)
+	}
 	sig.validate = func(h hash.Hash) error {
 		if knownKeys == nil {
 			return nil
 		}
-		if entity, key := findKey(pkt, knownKeys); key != nil {
-			setEntity(sig, entity)
-			return key.VerifySignature(h, pkt)
+		if key == nil {
+			return KeyNotFoundError{
+				KeyID:       sig.KeyId,
+				Fingerprint: sig.KeyFingerprint,
+			}
 		}
-		return KeyNotFoundError{
-			KeyID:       sig.KeyId,
-			Fingerprint: sig.KeyFingerprint,
-		}
+		return key.VerifySignature(h, pkt)
 	}
 	return sig, nil
 }

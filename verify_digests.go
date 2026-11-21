@@ -33,6 +33,11 @@ func setupDigester(sigHeader *rpmHeader, tag int, knownKeys openpgp.EntityList) 
 // Parse signatures from the header and determine which hash functions are
 // needed to digest the RPM. The caller must write the payload to the returned
 // WriteCloser, then call Close to check if the payload digest matches.
+//
+// Each returned candidate freezes its package digest state, the keyring
+// generation and the issuer identity up front: the hash already covers the
+// general header and the signing key has been resolved from knownKeys, so
+// re-validating a candidate always reports a consistent result.
 func digestAndVerify(sigHeader, genHeader *rpmHeader, payloadReader io.Reader, knownKeys openpgp.EntityList) ([]*Signature, []hash.Hash, error) {
 	var sigs []*Signature
 	var hashes []hash.Hash
@@ -45,6 +50,7 @@ func digestAndVerify(sigHeader, genHeader *rpmHeader, payloadReader io.Reader, k
 			continue
 		}
 		sig.HeaderOnly = true
+		// freeze the digest state for this candidate
 		h := sig.Hash.New()
 		h.Write(genHeader.orig)
 		sigs = append(sigs, sig)

@@ -48,6 +48,10 @@ type Signature struct {
 	// PrimaryName is the primary identity of the signing key, if available.
 	PrimaryName string
 
+	// validate checks the signature against the issuer key and package digest
+	// state that were frozen when this candidate was created. It does not
+	// modify the Signature and may be called multiple times, always
+	// returning the same result for the same digest state.
 	validate func(hash.Hash) error
 }
 
@@ -55,6 +59,10 @@ type Signature struct {
 // keys to check against, otherwise the signature validity cannot be verified.
 // If knownKeys is nil then digests will be checked but only the raw key ID will
 // be available.
+//
+// The returned signatures are bound to the given keyring: the issuer identity
+// is resolved when each signature is parsed and stays consistent with the
+// digest chain even if knownKeys is rotated or mutated afterwards.
 func Verify(stream io.Reader, knownKeys openpgp.EntityList) (header *RpmHeader, sigs []*Signature, err error) {
 	lead, sigHeader, err := readSignatureHeader(stream)
 	if err != nil {

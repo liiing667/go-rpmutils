@@ -20,16 +20,24 @@ func parseSignatureMaybeV3(genpkt packet.Packet, knownKeys openpgp.EntityList) (
 		CreationTime: pkt.CreationTime,
 		KeyId:        pkt.IssuerKeyId,
 	}
+	// Freeze the keyring generation and the issuer identity at the time the
+	// verification candidate is created, see parseSignatureV4.
+	var entity *openpgp.Entity
+	var key *packet.PublicKey
+	if keys := knownKeys.KeysById(pkt.IssuerKeyId); len(keys) != 0 && keys[0].PublicKey != nil {
+		entity, key = keys[0].Entity, keys[0].PublicKey
+	}
+	if entity != nil {
+		setEntity(sig, entity)
+	}
 	sig.validate = func(h hash.Hash) error {
 		if knownKeys == nil {
 			return nil
 		}
-		keys := knownKeys.KeysById(pkt.IssuerKeyId)
-		if len(keys) == 0 || keys[0].PublicKey == nil {
+		if key == nil {
 			return KeyNotFoundError{KeyID: pkt.IssuerKeyId}
 		}
-		setEntity(sig, keys[0].Entity)
-		return keys[0].PublicKey.VerifySignatureV3(h, pkt)
+		return key.VerifySignatureV3(h, pkt)
 	}
 	return sig, nil
 }
