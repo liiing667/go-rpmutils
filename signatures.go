@@ -225,7 +225,7 @@ func RewriteWithSignatures(infile *os.File, outpath string, sigPgp, sigRsa []byt
 	return header, nil
 }
 
-func rewriteRpm(infile *os.File, outpath string, header *RpmHeader) error {
+func rewriteRpm(infile *os.File, outpath string, header *RpmHeader) (err error) {
 	delete(header.sigHeader.entries, SIG_RESERVEDSPACE-_SIGHEADER_TAG_BASE)
 	ininfo, err := infile.Stat()
 	if err != nil {
@@ -235,7 +235,8 @@ func rewriteRpm(infile *os.File, outpath string, header *RpmHeader) error {
 	if outpath == "-" {
 		outstream = os.Stdout
 	} else {
-		outinfo, err := os.Lstat(outpath)
+		var outinfo os.FileInfo
+		outinfo, err = os.Lstat(outpath)
 		if err == nil && canOverwrite(ininfo, outinfo) {
 			ok, err := writeInPlace(outpath, header)
 			if err != nil || ok {
@@ -253,25 +254,42 @@ func rewriteRpm(infile *os.File, outpath string, header *RpmHeader) error {
 		}
 		if outstream == nil {
 			// write-rename
-			tempfile, err := os.CreateTemp(path.Dir(outpath), path.Base(outpath))
+			var tempfile *os.File
+			tempfile, err = os.CreateTemp(path.Dir(outpath), path.Base(outpath))
 			if err != nil {
 				return err
 			}
+			// Replace the output file only after the new package has
+			// been written out in full. If anything fails, remove the
+			// temporary file and leave the previous package untouched
+			// so that the signature header on disk always belongs to
+			// the package contents that follow it, even when signing
+			// is retried or the process restarts after a failure.
 			defer func() {
 				if err != nil {
+					_ = tempfile.Close()
 					os.Remove(tempfile.Name())
-				} else {
-					_ = tempfile.Chmod(0644)
-					if err = tempfile.Close(); err != nil {
-						return
-					}
-					err = os.Rename(tempfile.Name(), outpath)
+					return
+				}
+				_ = tempfile.Chmod(0644)
+				if err = tempfile.Sync(); err != nil {
+					_ = tempfile.Close()
+					os.Remove(tempfile.Name())
+					return
+				}
+				if err = tempfile.Close(); err != nil {
+					os.Remove(tempfile.Name())
+					return
+				}
+				if err = os.Rename(tempfile.Name(), outpath); err != nil {
+					os.Remove(tempfile.Name())
 				}
 			}()
 			outstream = tempfile
 		}
 	}
-	return writeRpm(infile, outstream, header.sigHeader)
+	err = writeRpm(infile, outstream, header.sigHeader)
+	return err
 }
 
 func writeInPlace(path string, header *RpmHeader) (ok bool, err error) {
@@ -290,12 +308,32 @@ func writeInPlace(path string, header *RpmHeader) (ok bool, err error) {
 	}
 	defer outfile.Close()
 	n, err := outfile.Write(blob)
+	if err == nil && n != len(blob) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
+		// The file may now hold a mix of the old and new signature
+		// headers. Make a best-effort attempt to restore the original
+		// signature header so that a later retry does not read a
+		// signature header left behind by this failed attempt.
+		restoreSignatureHeader(outfile, header)
 		return false, err
-	} else if n != len(blob) {
-		return false, io.ErrShortWrite
 	}
 	return true, nil
+}
+
+// restoreSignatureHeader makes a best-effort attempt to put the original
+// lead and signature header back at the start of the file after a failed
+// in-place rewrite, keeping the signature header and the package contents
+// consistent with each other.
+func restoreSignatureHeader(outfile *os.File, header *RpmHeader) {
+	if _, err := outfile.Seek(0, 0); err != nil {
+		return
+	}
+	orig := make([]byte, 0, len(header.lead)+len(header.sigHeader.orig))
+	orig = append(orig, header.lead...)
+	orig = append(orig, header.sigHeader.orig...)
+	_, _ = outfile.Write(orig)
 }
 
 func writeRpm(infile io.ReadSeeker, outstream io.Writer, sigHeader *rpmHeader) error {
