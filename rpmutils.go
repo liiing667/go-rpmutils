@@ -31,16 +31,59 @@ type Rpm struct {
 	f      io.Reader
 }
 
+// Generation returns the generation assigned to the header read that opened
+// this RPM. It is zero for a zero-value Rpm.
+func (rpm *Rpm) Generation() uint64 {
+	if rpm == nil || rpm.Header == nil {
+		return 0
+	}
+	return rpm.Header.Generation()
+}
+
+// Report returns the retained report for the header read that opened this RPM.
+func (rpm *Rpm) Report() HeaderReport {
+	if rpm == nil || rpm.Header == nil {
+		return HeaderReport{Tag: -1, Stage: StageStart}
+	}
+	return rpm.Header.Report()
+}
+
 // RpmHeader holds the signature header and general header of a RPM
 //
 // Tags are drawn from both header areas, with IDs between _GENERAL_TAG_BASE and
 // _SIGHEADER_TAG_BASE coming from the general header and all others coming from
 // the signature header.
 type RpmHeader struct {
-	lead      []byte
-	sigHeader *rpmHeader
-	genHeader *rpmHeader
-	isSource  bool
+	lead       []byte
+	sigHeader  *rpmHeader
+	genHeader  *rpmHeader
+	isSource   bool
+	generation uint64
+	report     HeaderReport
+}
+
+// Generation returns the monotonically increasing generation assigned to the
+// read attempt that produced this header.
+func (hdr *RpmHeader) Generation() uint64 {
+	if hdr == nil {
+		return 0
+	}
+	return hdr.generation
+}
+
+// Report returns the retained report for this header. On a successful read the
+// stage is StageComplete and Offset is the absolute end of the header (or of
+// the payload when the header came from Verify).
+func (hdr *RpmHeader) Report() HeaderReport {
+	if hdr == nil {
+		return HeaderReport{Tag: -1, Stage: StageStart}
+	}
+	report := hdr.report
+	if report.Stage == "" {
+		report.Tag = -1
+		report.Stage = StageStart
+	}
+	return report
 }
 
 // ReadRpm reads the header from a RPM file and prepares to read payload contents
@@ -95,43 +138,79 @@ func (rpm *Rpm) PayloadReaderExtended() (PayloadReader, error) {
 //
 // The stream is positioned for reading the compressed payload following the headers.
 func ReadHeader(f io.Reader) (*RpmHeader, error) {
-	lead, sigHeader, err := readSignatureHeader(f)
+	return readRpmHeaderWithContext(newHeaderContext(f))
+}
+
+// ReadHeaderWithReport is ReadHeader with the retained report returned even
+// when the read fails. The report contains the generation, absolute offset,
+// failed tag, and stage.
+func ReadHeaderWithReport(f io.Reader) (*RpmHeader, HeaderReport, error) {
+	ctx := newHeaderContext(f)
+	header, err := readRpmHeaderWithContext(ctx)
+	if err != nil {
+		var headerErr *HeaderError
+		if errors.As(err, &headerErr) {
+			return nil, headerErr.Report(), err
+		}
+		return nil, HeaderReport{
+			Generation: ctx.generation,
+			Tag:        -1,
+			Stage:      StageStart,
+			Err:        err,
+		}, err
+	}
+	return header, header.Report(), nil
+}
+
+func readSignatureHeader(f io.Reader) ([]byte, *rpmHeader, error) {
+	return readSignatureHeaderWithContext(newHeaderContext(f))
+}
+
+func readRpmHeaderWithContext(ctx *headerContext) (*RpmHeader, error) {
+	lead, sigHeader, err := readSignatureHeaderWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	hash, hashType := getHashAndType(sigHeader)
-	genHeader, err := readHeader(f, hash, hashType, sigHeader.isSource, false)
+	checks, err := headerDigestChecks(sigHeader, nil, false)
+	if err != nil {
+		sigStart := ctx.offset() - int64(len(sigHeader.orig))
+		return nil, ctx.fail(StageHeaderDigest, sigStart, -1, err)
+	}
+	genHeader, err := readHeaderWithContext(ctx, sigHeader.isSource, false, checks)
 	if err != nil {
 		return nil, err
 	}
 
 	return &RpmHeader{
-		lead:      lead,
-		sigHeader: sigHeader,
-		genHeader: genHeader,
-		isSource:  sigHeader.isSource,
+		lead:       lead,
+		sigHeader:  sigHeader,
+		genHeader:  genHeader,
+		isSource:   sigHeader.isSource,
+		generation: ctx.generation,
+		report:     ctx.complete(),
 	}, nil
 }
 
-func readSignatureHeader(f io.Reader) ([]byte, *rpmHeader, error) {
+func readSignatureHeaderWithContext(ctx *headerContext) ([]byte, *rpmHeader, error) {
+	leadStart := ctx.offset()
 	// Read signature header
-	lead, err := readExact(f, 96)
+	lead, err := ctx.readExact(96, StageLead, -1)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error reading RPM lead: %s", err.Error())
+		return nil, nil, err
 	}
 
 	// Check file magic
 	magic := binary.BigEndian.Uint32(lead[0:4])
 	if magic&0xffffffff != 0xedabeedb {
-		return nil, nil, fmt.Errorf("file is not an RPM")
+		return nil, nil, ctx.fail(StageLead, leadStart, -1, fmt.Errorf("file is not an RPM"))
 	}
 
 	// Check source flag
 	isSource := binary.BigEndian.Uint16(lead[6:8]) == 1
 
 	// Return signature header
-	hdr, err := readHeader(f, "", 0, isSource, true)
+	hdr, err := readHeaderWithContext(ctx, isSource, true, nil)
 	return lead, hdr, err
 }
 

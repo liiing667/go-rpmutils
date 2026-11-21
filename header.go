@@ -24,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"path"
 	"strconv"
 	"strings"
@@ -31,15 +33,48 @@ import (
 
 const introMagic = 0x8eade801
 
+const (
+	headerIntroSize = 16
+	headerTagSize   = 16
+
+	// Hard upper bounds on a single header section. They are large enough for
+	// any well-formed RPM while preventing a malformed header from triggering
+	// huge allocations or out-of-memory failures.
+	maxHeaderEntries = 1 << 20 // at most 1M index entries (~16MiB index)
+	maxHeaderSize    = 1 << 28 // at most 256MiB of entry data
+)
+
+// stringTypes are null-terminated string data types. A single string entry is
+// always followed by a trailing NUL byte, while string arrays hold one NUL
+// terminated string per element.
+var stringTypes = map[int32]bool{
+	RPM_STRING_TYPE:       true,
+	RPM_STRING_ARRAY_TYPE: true,
+	RPM_I18NSTRING_TYPE:   true,
+}
+
+// regionTags delimit RPM header regions. They must hold a 16-byte BIN value
+// containing the region trailer.
+var regionTags = map[int32]bool{
+	RPMTAG_HEADERSIGNATURES: true,
+	RPMTAG_HEADERIMMUTABLE:  true,
+	RPMTAG_HEADERREGIONS:    true,
+}
+
 type entry struct {
 	dataType, count int32
 	contents        []byte
+	// offset is the absolute stream offset of contents, retained for
+	// diagnostics. It is not used by the existing accessor APIs.
+	offset int64
 }
 
 type rpmHeader struct {
-	entries  map[int]entry
-	isSource bool
-	orig     []byte
+	entries    map[int]entry
+	isSource   bool
+	orig       []byte
+	generation uint64
+	report     HeaderReport
 }
 
 type headerIntro struct {
@@ -72,76 +107,236 @@ func readExact(f io.Reader, n int) ([]byte, error) {
 	return buf, err
 }
 
+// readHeader is kept as a compatibility wrapper for internal callers and
+// tests. New code should share a headerContext across all sections of one
+// attempt so the header, payload, and error report share a generation and
+// absolute offset.
 func readHeader(f io.Reader, hash string, hashType crypto.Hash, isSource bool, sigBlock bool) (*rpmHeader, error) {
-	// save original header
-	var origBuf bytes.Buffer
-	f = io.TeeReader(f, &origBuf)
-	// verify intro
-	var intro headerIntro
-	if err := binary.Read(f, binary.BigEndian, &intro); err != nil {
-		return nil, fmt.Errorf("error reading RPM header: %s", err.Error())
+	ctx := newHeaderContext(f)
+	var checks []digestCheck
+	if hash != "" {
+		if hashType == 0 || !hashType.Available() {
+			return nil, ctx.fail(StageHeaderDigest, 0, -1, fmt.Errorf("digest %q uses unavailable hash %s", hash, hashType))
+		}
+		checks = append(checks, digestCheck{
+			Tag:      headerDigestTag(hashType),
+			Hash:     hashType,
+			Expected: hash,
+		})
+	}
+	return readHeaderWithContext(ctx, isSource, sigBlock, checks)
+}
+
+func headerDigestTag(hashType crypto.Hash) int {
+	switch hashType {
+	case crypto.SHA256:
+		return SIG_SHA256
+	case crypto.SHA1:
+		return SIG_SHA1
+	default:
+		return -1
+	}
+}
+
+// readHeaderWithContext reads one header section using the supplied context.
+// The context owns the stream position and generation, so a signature header,
+// general header, and payload digest in the same attempt are reported with the
+// same generation and absolute offsets.
+func readHeaderWithContext(ctx *headerContext, isSource bool, sigBlock bool, checks []digestCheck) (*rpmHeader, error) {
+	headerStart := ctx.offset()
+
+	introBuf, err := ctx.readExact(headerIntroSize, StageHeaderIntro, -1)
+	if err != nil {
+		return nil, err
+	}
+	intro := headerIntro{
+		Magic:    binary.BigEndian.Uint32(introBuf[0:4]),
+		Reserved: binary.BigEndian.Uint32(introBuf[4:8]),
+		Entries:  binary.BigEndian.Uint32(introBuf[8:12]),
+		Size:     binary.BigEndian.Uint32(introBuf[12:16]),
 	}
 	if intro.Magic != introMagic {
-		return nil, fmt.Errorf("bad magic for header")
+		return nil, ctx.fail(StageHeaderIntro, headerStart, -1, fmt.Errorf("bad magic for header"))
 	}
-	// read entries
-	entryTable, err := readExact(f, int(intro.Entries*16))
+	if intro.Entries == 0 {
+		return nil, ctx.fail(StageHeaderIntro, headerStart, -1, fmt.Errorf("RPM header has no entries"))
+	}
+	if intro.Entries > maxHeaderEntries {
+		return nil, ctx.fail(StageHeaderIntro, headerStart, -1,
+			fmt.Errorf("RPM header entry count %d exceeds maximum of %d", intro.Entries, maxHeaderEntries))
+	}
+	if intro.Size > maxHeaderSize {
+		return nil, ctx.fail(StageHeaderIntro, headerStart, -1,
+			fmt.Errorf("RPM header data size %d exceeds maximum of %d", intro.Size, maxHeaderSize))
+	}
+	// Entries*16 cannot overflow on 32-bit platforms thanks to the bound
+	// above, but guard anyway so a future limit change cannot reintroduce the
+	// issue.
+	hi, tableLen := bits.Mul64(uint64(intro.Entries), uint64(headerTagSize))
+	if hi != 0 || tableLen > math.MaxInt {
+		return nil, ctx.fail(StageHeaderIntro, headerStart, -1,
+			fmt.Errorf("RPM header table size overflows for %d entries", intro.Entries))
+	}
+
+	// Save the exact header bytes. This is both the digest input and the
+	// canonical representation returned by the existing header APIs.
+	var origBuf bytes.Buffer
+	origBuf.Write(introBuf)
+
+	tableStart := ctx.offset()
+	entryTable, err := ctx.readExact(int(tableLen), StageHeaderIndex, -1)
 	if err != nil {
-		return nil, fmt.Errorf("error reading RPM header table: %s", err.Error())
+		return nil, err
 	}
-	// read data
-	size := intro.Size
+	origBuf.Write(entryTable)
+
+	declaredSize := uint64(intro.Size)
+	dataSize := declaredSize
 	if sigBlock {
 		// signature block is padded to 8 byte alignment
-		size = (size + 7) / 8 * 8
+		dataSize = (declaredSize + 7) / 8 * 8
+		if dataSize > maxHeaderSize+7 {
+			return nil, ctx.fail(StageHeaderIntro, headerStart, -1,
+				fmt.Errorf("RPM header padded data size %d exceeds maximum", dataSize))
+		}
 	}
-	data, err := readExact(f, int(size))
+	if dataSize > math.MaxInt {
+		return nil, ctx.fail(StageHeaderIntro, headerStart, -1,
+			fmt.Errorf("RPM header data size %d overflows int", dataSize))
+	}
+	dataStart := ctx.offset()
+	data, err := ctx.readExact(int(dataSize), StageHeaderData, -1)
 	if err != nil {
-		return nil, fmt.Errorf("error reading RPM header data: %s", err.Error())
+		return nil, err
 	}
-	// Check hash if it was specified
-	if len(hash) > 1 {
-		h := hashType.New()
-		h.Write(origBuf.Bytes())
-		calculated := hex.EncodeToString(h.Sum(nil))
-		if calculated != hash {
-			return nil, fmt.Errorf("%s mismatch in signature header", hashType)
+	origBuf.Write(data)
+
+	// Verify every digest that is present. Verifying only the preferred tag
+	// would allow a malformed header to carry contradictory digest tags and
+	// let different readers disagree about the package identity.
+	orig := origBuf.Bytes()
+	for _, check := range checks {
+		offset := check.Offset
+		if offset <= 0 {
+			offset = headerStart
+		}
+		if check.Hash == 0 || !check.Hash.Available() {
+			return nil, ctx.fail(StageHeaderDigest, offset, check.Tag,
+				fmt.Errorf("unknown header digest %s", check.Hash))
+		}
+		hasher := check.Hash.New()
+		hasher.Write(orig)
+		calculated := hex.EncodeToString(hasher.Sum(nil))
+		if !strings.EqualFold(calculated, check.Expected) {
+			return nil, ctx.fail(StageHeaderDigest, offset, check.Tag, &DigestMismatchError{
+				Scope:    "header",
+				Hash:     check.Hash,
+				Expected: check.Expected,
+				Actual:   calculated,
+			})
 		}
 	}
-	// parse entries
-	ents := make(map[int]entry)
-	buf := bytes.NewReader(entryTable)
+
+	// Parse and validate the tag index. The data slice used for entries is
+	// limited to the declared (unpadded) size; signature block padding is not
+	// part of any entry.
+	dataDeclared := data[:int(declaredSize)]
+	ents := make(map[int]entry, int(intro.Entries))
 	for i := 0; i < int(intro.Entries); i++ {
-		var tag headerTag
-		if err := binary.Read(buf, binary.BigEndian, &tag); err != nil {
-			return nil, err
+		entryStart := tableStart + int64(i*headerTagSize)
+		record := entryTable[i*headerTagSize : (i+1)*headerTagSize]
+		tag := headerTag{
+			Tag:      int32(binary.BigEndian.Uint32(record[0:4])),
+			DataType: int32(binary.BigEndian.Uint32(record[4:8])),
+			Offset:   int32(binary.BigEndian.Uint32(record[8:12])),
+			Count:    int32(binary.BigEndian.Uint32(record[12:16])),
 		}
-		typeSize, ok := typeSizes[tag.DataType]
-		var end int
-		if ok {
-			end = int(tag.Offset) + typeSize*int(tag.Count)
-		} else {
-			// String types are null-terminated
-			end = int(tag.Offset)
-			for i := 0; i < int(tag.Count); i++ {
-				next := bytes.IndexByte(data[end:], 0)
-				if next < 0 {
-					return nil, fmt.Errorf("tag %d is truncated", tag.Tag)
-				}
-				end += next + 1
+		if tag.Offset < 0 {
+			return nil, ctx.fail(StageHeaderEntry, dataStart, int(tag.Tag),
+				fmt.Errorf("tag %d has negative offset %d", tag.Tag, tag.Offset))
+		}
+		if tag.Count < 0 {
+			return nil, ctx.fail(StageHeaderEntry, dataStart, int(tag.Tag),
+				fmt.Errorf("tag %d has negative count %d", tag.Tag, tag.Count))
+		}
+		if uint32(tag.Offset) > intro.Size {
+			return nil, ctx.fail(StageHeaderEntry, dataStart+int64(tag.Offset), int(tag.Tag),
+				fmt.Errorf("tag %d offset %d is outside of header data", tag.Tag, tag.Offset))
+		}
+		if regionTags[tag.Tag] && (tag.DataType != RPM_BIN_TYPE || tag.Count != 16) {
+			return nil, ctx.fail(StageHeaderEntry, dataStart+int64(tag.Offset), int(tag.Tag),
+				fmt.Errorf("region tag %d must be a 16-byte BIN entry", tag.Tag))
+		}
+
+		var end uint64
+		typeSize, fixedType := typeSizes[tag.DataType]
+		switch {
+		case fixedType:
+			hi, dataLen := bits.Mul64(uint64(tag.Count), uint64(typeSize))
+			if hi != 0 {
+				return nil, ctx.fail(StageHeaderEntry, dataStart+int64(tag.Offset), int(tag.Tag),
+					fmt.Errorf("tag %d data length overflows", tag.Tag))
 			}
+			end64, carry := bits.Add64(uint64(tag.Offset), dataLen, 0)
+			if carry != 0 || end64 > declaredSize {
+				return nil, ctx.fail(StageHeaderEntry, dataStart+int64(tag.Offset), int(tag.Tag),
+					fmt.Errorf("tag %d data extends beyond header data", tag.Tag))
+			}
+			end = end64
+		case stringTypes[tag.DataType]:
+			if tag.Count == 0 {
+				return nil, ctx.fail(StageHeaderString, dataStart+int64(tag.Offset), int(tag.Tag),
+					fmt.Errorf("string tag %d has no elements", tag.Tag))
+			}
+			// Every string element needs at least one byte (its NUL), so a
+			// count larger than the declared data area is necessarily
+			// malformed. This also bounds the scanning loop on 32-bit
+			// platforms.
+			if uint64(tag.Count) > declaredSize {
+				return nil, ctx.fail(StageHeaderString, dataStart+int64(tag.Offset), int(tag.Tag),
+					fmt.Errorf("string tag %d has %d elements but only %d bytes of data", tag.Tag, tag.Count, declaredSize))
+			}
+			end = uint64(tag.Offset)
+			for element := 0; element < int(tag.Count); element++ {
+				if end >= declaredSize {
+					return nil, ctx.fail(StageHeaderString, dataStart+int64(end), int(tag.Tag),
+						fmt.Errorf("tag %d is truncated", tag.Tag))
+				}
+				next := bytes.IndexByte(dataDeclared[int(end):], 0)
+				if next < 0 {
+					return nil, ctx.fail(StageHeaderString, dataStart+int64(end), int(tag.Tag),
+						fmt.Errorf("tag %d is truncated", tag.Tag))
+				}
+				end += uint64(next) + 1
+				if end > declaredSize {
+					return nil, ctx.fail(StageHeaderString, dataStart+int64(end), int(tag.Tag),
+						fmt.Errorf("tag %d string data extends beyond header data", tag.Tag))
+				}
+			}
+		default:
+			return nil, ctx.fail(StageHeaderEntry, dataStart+int64(tag.Offset), int(tag.Tag),
+				DataTypeError{Tag: int(tag.Tag), DataType: int(tag.DataType)})
+		}
+
+		if _, exists := ents[int(tag.Tag)]; exists {
+			return nil, ctx.fail(StageHeaderEntry, entryStart, int(tag.Tag),
+				DuplicateTagError{Tag: int(tag.Tag)})
 		}
 		ents[int(tag.Tag)] = entry{
 			dataType: tag.DataType,
 			count:    tag.Count,
-			contents: data[tag.Offset:end],
+			contents: dataDeclared[int(tag.Offset):int(end)],
+			offset:   dataStart + int64(tag.Offset),
 		}
 	}
 
+	report := ctx.complete()
 	return &rpmHeader{
-		entries:  ents,
-		isSource: isSource,
-		orig:     origBuf.Bytes(),
+		entries:    ents,
+		isSource:   isSource,
+		orig:       append([]byte(nil), orig...),
+		generation: ctx.generation,
+		report:     report,
 	}, nil
 }
 
@@ -172,7 +367,7 @@ func (hdr *rpmHeader) Get(tag int) (interface{}, error) {
 	case RPM_BIN_TYPE:
 		return hdr.GetBytes(tag)
 	default:
-		return nil, fmt.Errorf("unsupported data type")
+		return nil, DataTypeError{Tag: tag, DataType: int(ent.dataType)}
 	}
 }
 
@@ -194,8 +389,14 @@ func (hdr *rpmHeader) GetStrings(tag int) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(dirIdxs) < len(baseNames) {
+			return nil, fmt.Errorf("DIRINDEXES has %d entries but BASENAMES has %d", len(dirIdxs), len(baseNames))
+		}
 		paths := make([]string, 0, len(baseNames))
 		for i, base := range baseNames {
+			if uint64(dirIdxs[i]) >= uint64(len(dirs)) {
+				return nil, fmt.Errorf("DIRINDEXES entry %d refers to missing directory %d", i, dirIdxs[i])
+			}
 			paths = append(paths, path.Join(dirs[dirIdxs[i]], base))
 		}
 		return paths, nil
@@ -208,6 +409,9 @@ func (hdr *rpmHeader) GetStrings(tag int) ([]string, error) {
 		return nil, fmt.Errorf("unsupported datatype for string: %d, tag: %d", ent.dataType, tag)
 	}
 	strs := strings.Split(string(ent.contents), "\x00")
+	if len(strs) < int(ent.count) {
+		return nil, fmt.Errorf("string tag %d is truncated", tag)
+	}
 	return strs[:ent.count], nil
 }
 
@@ -352,6 +556,9 @@ func (hdr *rpmHeader) GetNEVRA() (*NEVRA, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(name) == 0 {
+		return nil, fmt.Errorf("tag %d is empty", NAME)
+	}
 	epoch, err := hdr.GetUint64s(EPOCH)
 	if _, absent := err.(NoSuchTagError); !absent && err != nil {
 		return nil, err
@@ -363,13 +570,22 @@ func (hdr *rpmHeader) GetNEVRA() (*NEVRA, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(version) == 0 {
+		return nil, fmt.Errorf("tag %d is empty", VERSION)
+	}
 	release, err := hdr.GetStrings(RELEASE)
 	if err != nil {
 		return nil, err
 	}
+	if len(release) == 0 {
+		return nil, fmt.Errorf("tag %d is empty", RELEASE)
+	}
 	arch, err := hdr.GetStrings(ARCH)
 	if err != nil {
 		return nil, err
+	}
+	if len(arch) == 0 {
+		return nil, fmt.Errorf("tag %d is empty", ARCH)
 	}
 	return &NEVRA{
 		Name:    name[0],
@@ -432,6 +648,25 @@ func (hdr *rpmHeader) GetFiles() ([]FileInfo, error) {
 	inodes, err := hdr.GetUint32s(FILEINODES)
 	if err != nil {
 		inodes = make([]uint32, len(paths))
+	}
+	for _, array := range []struct {
+		tag  int
+		size int
+	}{
+		{FILESIZES, len(fileSizes)},
+		{FILEUSERNAME, len(fileUserName)},
+		{FILEGROUPNAME, len(fileGroupName)},
+		{FILEFLAGS, len(fileFlags)},
+		{FILEMTIMES, len(fileMtimes)},
+		{FILEDIGESTS, len(fileDigests)},
+		{FILEMODES, len(fileModes)},
+		{FILELINKTOS, len(linkTos)},
+		{FILEDEVICES, len(devices)},
+		{FILEINODES, len(inodes)},
+	} {
+		if array.size < len(paths) {
+			return nil, fmt.Errorf("tag %d has %d entries but OLDFILENAMES has %d", array.tag, array.size, len(paths))
+		}
 	}
 
 	files := make([]FileInfo, len(paths))

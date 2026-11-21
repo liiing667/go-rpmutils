@@ -61,6 +61,18 @@ func main() {
 Passing `nil` as the keyring will parse the signature without validating it, so
 that the signers' key ID can be inspected.
 
+`Verify` always validates the complete digest chain: every header digest tag
+present in the signature header, the `PAYLOADDIGEST` in the general header, and
+the legacy `SIG_MD5` tag when present. A package that only carries legacy
+SHA1/MD5 digests is rejected by default. Use `VerifyWithOptions` with
+`VerifyOptions{AllowWeakDigests: true}` for those old packages.
+
+Header reads are assigned a monotonically increasing generation, including
+failed and cancelled attempts. `ReadHeaderWithReport`, `RpmHeader.Report`, and
+the `*HeaderError` returned by `ReadHeader`/`Verify` retain the generation,
+absolute stream offset, failed tag, and stage so a retry or restart can be
+diagnosed without reusing stale state.
+
 By default rpmutils uses the
 [ProtonMail](https://github.com/ProtonMail/go-crypto) PGP implementation, which
 supports PGP v4 and later signatures. PGP v4 was released in 1998, and yet some

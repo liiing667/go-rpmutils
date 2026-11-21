@@ -90,7 +90,7 @@ func insertSignatures(sigHeader *rpmHeader, sigPgp, sigRsa []byte) {
 
 func getSha1(sigHeader *rpmHeader) string {
 	vals, err := sigHeader.GetStrings(SIG_SHA1)
-	if err != nil {
+	if err != nil || len(vals) == 0 {
 		return ""
 	}
 	return vals[0]
@@ -98,7 +98,7 @@ func getSha1(sigHeader *rpmHeader) string {
 
 func getSha256(sigHeader *rpmHeader) string {
 	vals, err := sigHeader.GetStrings(SIG_SHA256)
-	if err != nil {
+	if err != nil || len(vals) == 0 {
 		return ""
 	}
 	return vals[0]
@@ -114,47 +114,61 @@ func getHashAndType(sigHeader *rpmHeader) (string, crypto.Hash) {
 }
 
 func digestForSigning(sigHeader, genHeader *rpmHeader, payloadReader io.Reader, opts *SignatureOptions) (genHash, combinedHash hash.Hash, err error) {
+	ctx := newHeaderContext(payloadReader)
+	return digestForSigningWithContext(ctx, sigHeader, genHeader, ctx.reader, opts)
+}
+
+func digestForSigningWithContext(ctx *headerContext, sigHeader, genHeader *rpmHeader, payloadReader io.Reader, opts *SignatureOptions) (genHash, combinedHash hash.Hash, err error) {
 	genHash, combinedHash = opts.hash().New(), opts.hash().New()
 	// write header
 	genHash.Write(genHeader.orig)
 	combinedHash.Write(genHeader.orig)
-	// write and verify payload
-	err = digestPayload(sigHeader, genHeader, payloadReader, []io.Writer{combinedHash})
+	// write and verify payload; legacy packages may only carry weak
+	// digests, which are still better than signing unverified contents
+	err = digestPayloadWithContext(ctx, sigHeader, genHeader, payloadReader,
+		[]io.Writer{combinedHash}, &VerifyOptions{AllowWeakDigests: true})
 	return genHash, combinedHash, err
 }
 
 // SignRpmStream reads an RPM and signs it, returning the set of headers updated with the new signature.
 func SignRpmStream(stream io.Reader, key *packet.PrivateKey, opts *SignatureOptions) (header *RpmHeader, err error) {
-	lead, sigHeader, err := readSignatureHeader(stream)
+	ctx := newHeaderContext(stream)
+	lead, sigHeader, err := readSignatureHeaderWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	// parse the general header
-	headerDigestValue, headerDigestType := getHashAndType(sigHeader)
-	genHeader, err := readHeader(stream, headerDigestValue, headerDigestType, sigHeader.isSource, false)
+	checks, err := headerDigestChecks(sigHeader, nil, false)
+	if err != nil {
+		sigStart := ctx.offset() - int64(len(sigHeader.orig))
+		return nil, ctx.fail(StageHeaderDigest, sigStart, -1, err)
+	}
+	genHeader, err := readHeaderWithContext(ctx, sigHeader.isSource, false, checks)
 	if err != nil {
 		return nil, err
 	}
 	// hash and sign header
-	genHash, combinedHash, err := digestForSigning(sigHeader, genHeader, stream, opts)
+	genHash, combinedHash, err := digestForSigningWithContext(ctx, sigHeader, genHeader, ctx.reader, opts)
 	if err != nil {
 		return nil, err
 	}
 	// sign header and payload
 	sigPgp, err := makeSignature(combinedHash, key, opts)
 	if err != nil {
-		return
+		return nil, ctx.fail(StagePGPSignature, ctx.offset(), -1, err)
 	}
 	sigRsa, err := makeSignature(genHash, key, opts)
 	if err != nil {
-		return nil, err
+		return nil, ctx.fail(StagePGPSignature, ctx.offset(), -1, err)
 	}
 	insertSignatures(sigHeader, sigPgp, sigRsa)
 	return &RpmHeader{
-		lead:      lead,
-		sigHeader: sigHeader,
-		genHeader: genHeader,
-		isSource:  sigHeader.isSource,
+		lead:       lead,
+		sigHeader:  sigHeader,
+		genHeader:  genHeader,
+		isSource:   sigHeader.isSource,
+		generation: ctx.generation,
+		report:     ctx.complete(),
 	}, nil
 }
 
